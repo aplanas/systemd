@@ -22,6 +22,7 @@
 #include "initrd-util.h"
 #include "io-util.h"
 #include "json-util.h"
+#include "libfido2-util.h"
 #include "log.h"
 #include "logarithm.h"
 #include "memory-util.h"
@@ -7356,6 +7357,9 @@ int tpm2_make_luks2_json(
                 const struct iovec *srk,
                 const struct iovec *pcrlock_nv,
                 TPM2Flags flags,
+                const struct iovec *fido2_cid,
+                const struct iovec *fido2_salt,
+                Fido2EnrollFlags fido2_flags,
                 sd_json_variant **ret) {
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *hmj = NULL, *pkmj = NULL;
@@ -7408,7 +7412,13 @@ int tpm2_make_luks2_json(
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(pubkey), "tpm2_pubkey", JSON_BUILD_IOVEC_BASE64(pubkey)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(salt), "tpm2_salt", JSON_BUILD_IOVEC_BASE64(salt)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(srk), "tpm2_srk", JSON_BUILD_IOVEC_BASE64(srk)),
-                        SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(pcrlock_nv), "tpm2_pcrlock_nv", JSON_BUILD_IOVEC_BASE64(pcrlock_nv)));
+                        SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(pcrlock_nv), "tpm2_pcrlock_nv", JSON_BUILD_IOVEC_BASE64(pcrlock_nv)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_FIDO2), "fido2-credential", JSON_BUILD_IOVEC_BASE64(fido2_cid)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_FIDO2), "fido2-salt", JSON_BUILD_IOVEC_BASE64(fido2_salt)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_FIDO2), "fido2-rp", JSON_BUILD_CONST_STRING("io.systemd.cryptsetup")),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_FIDO2), "fido2-clientPin-required", SD_JSON_BUILD_BOOLEAN(FLAGS_SET(fido2_flags, FIDO2ENROLL_PIN))),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_FIDO2), "fido2-up-required", SD_JSON_BUILD_BOOLEAN(FLAGS_SET(fido2_flags, FIDO2ENROLL_UP))),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_FIDO2), "fido2-uv-required", SD_JSON_BUILD_BOOLEAN(FLAGS_SET(fido2_flags, FIDO2ENROLL_UV))));
         if (r < 0)
                 return r;
 
@@ -7490,14 +7500,20 @@ int tpm2_parse_luks2_json(
                 struct iovec *ret_salt,
                 struct iovec *ret_srk,
                 struct iovec *ret_pcrlock_nv,
-                TPM2Flags *ret_flags) {
+                TPM2Flags *ret_flags,
+                struct iovec *ret_fido2_cid,
+                struct iovec *ret_fido2_salt,
+                char **ret_fido2_rp_id,
+                Fido2EnrollFlags *ret_fido2_flags) {
 
-        _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
+        _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {}, fido2_cid = {}, fido2_salt = {};
         uint32_t hash_pcr_mask = 0, pubkey_pcr_mask = 0;
         uint16_t primary_alg = TPM2_ALG_ECC; /* ECC was the only supported algorithm in systemd < 250, use that as implied default, for compatibility */
         uint16_t pcr_bank = UINT16_MAX; /* default: pick automatically */
         int r, keyslot = -1;
         TPM2Flags flags = 0;
+        Fido2EnrollFlags fido2_flags = 0;
+        _cleanup_free_ char *fido2_rp = NULL;
         sd_json_variant *w;
 
         assert(v);
@@ -7629,6 +7645,52 @@ int tpm2_parse_luks2_json(
                         return log_debug_errno(r, "Invalid base64 data in 'tpm2_pcrlock_nv' field.");
         }
 
+        w = sd_json_variant_by_key(v, "fido2-credential");
+        if (w) {
+                r = json_variant_unbase64_iovec(w, &fido2_cid);
+                if (r < 0)
+                        return log_debug_errno(r, "Invalid base64 data in 'fido2-credential' field.");
+        }
+
+        w = sd_json_variant_by_key(v, "fido2-salt");
+        if (w) {
+                r = json_variant_unbase64_iovec(w, &fido2_salt);
+                if (r < 0)
+                        return log_debug_errno(r, "Invalid base64 data in 'fido2-salt' field.");
+        }
+
+        w = sd_json_variant_by_key(v, "fido2-rp");
+        if (w) {
+                /* The "rp" field is optional. */
+                fido2_rp = strdup(sd_json_variant_string(w));
+                if (!fido2_rp)
+                        return log_oom_debug();
+        }
+
+        w = sd_json_variant_by_key(v, "fido2-clientPin-required");
+        if (w) {
+                if (!sd_json_variant_is_boolean(w))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "FIDO2 client PIN required is not a boolean.");
+
+                SET_FLAG(fido2_flags, FIDO2ENROLL_PIN, sd_json_variant_boolean(w));
+        }
+
+        w = sd_json_variant_by_key(v, "fido2-up-required");
+        if (w) {
+                if (!sd_json_variant_is_boolean(w))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "FIDO2 user presence required is not a boolean.");
+
+                SET_FLAG(fido2_flags, FIDO2ENROLL_UP, sd_json_variant_boolean(w));
+        }
+
+        w = sd_json_variant_by_key(v, "fido2-uv-required");
+        if (w) {
+                if (!sd_json_variant_is_boolean(w))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "FIDO2 user validation required is not a boolean.");
+
+                SET_FLAG(fido2_flags, FIDO2ENROLL_UV, sd_json_variant_boolean(w));
+        }
+
         if (ret_keyslot)
                 *ret_keyslot = keyslot;
         if (ret_hash_pcr_mask)
@@ -7657,6 +7719,14 @@ int tpm2_parse_luks2_json(
                 *ret_pcrlock_nv = TAKE_STRUCT(pcrlock_nv);
         if (ret_flags)
                 *ret_flags = flags;
+        if (ret_fido2_cid)
+                *ret_fido2_cid = TAKE_STRUCT(fido2_cid);
+        if (ret_fido2_salt)
+                *ret_fido2_salt = TAKE_STRUCT(fido2_salt);
+        if (ret_fido2_rp_id)
+                *ret_fido2_rp_id = TAKE_STRUCT(fido2_rp);
+        if (ret_fido2_flags)
+                *ret_fido2_flags = fido2_flags;
         return 0;
 }
 
