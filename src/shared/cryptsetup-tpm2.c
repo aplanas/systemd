@@ -9,6 +9,7 @@
 #include "env-util.h"
 #include "fileio.h"
 #include "hexdecoct.h"
+#include "libfido2-util.h"
 #include "log.h"
 #include "random-util.h"
 #include "strv.h"
@@ -284,13 +285,15 @@ int find_tpm2_auto_data(
         assert(ret_token);
 
         for (token = start_token; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
-                _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
+                _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {}, fido2_cid = {}, fido2_salt = {};
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
                 struct iovec *blobs = NULL, *policy_hash = NULL;
                 size_t n_blobs = 0, n_policy_hash = 0;
                 uint32_t hash_pcr_mask, pubkey_pcr_mask;
                 uint16_t pcr_bank, primary_alg;
                 TPM2Flags flags;
+                Fido2EnrollFlags fido2_flags;
+                _cleanup_free_ char *fido2_rp = NULL;
                 int keyslot;
 
                 CLEANUP_ARRAY(blobs, n_blobs, iovec_array_free);
@@ -317,7 +320,11 @@ int find_tpm2_auto_data(
                                 &salt,
                                 &srk,
                                 &pcrlock_nv,
-                                &flags);
+                                &flags,
+                                &fido2_cid,
+                                &fido2_salt,
+                                &fido2_rp,
+                                &fido2_flags);
                 if (r == -EUCLEAN) /* Gracefully handle issues in JSON fields not owned by us */
                         continue;
                 if (r < 0)
