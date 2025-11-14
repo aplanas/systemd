@@ -132,6 +132,6 @@ static inline int parse_fido2_algorithm(const char *s, int *ret) {
 #endif
 
 int fido2_list_devices(void);
-int fido2_find_device_auto(char **ret);
+int fido2_find_device_auto(bool hmac_secret, char **ret);
 
 int fido2_have_device(const char *device);

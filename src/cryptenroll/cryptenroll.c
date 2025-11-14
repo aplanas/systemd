@@ -673,7 +673,7 @@ static int parse_argv(int argc, char *argv[]) {
                                                "FIDO2 parameters' storage in the LUKS2 header was disabled, but no salt file provided, refusing.");
 
                 if (!arg_fido2_device) {
-                        r = fido2_find_device_auto(&arg_fido2_device);
+                        r = fido2_find_device_auto(/* hmac_secret= */ true, &arg_fido2_device);
                         if (r < 0)
                                 return r;
                 }
