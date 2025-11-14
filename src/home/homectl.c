@@ -3864,7 +3864,7 @@ static int parse_fido2_device_field(const char *arg) {
 
         if (streq(arg, "auto")) {
                 char *found;
-                r = fido2_find_device_auto(&found);
+                r = fido2_find_device_auto(/* require_fido2= */ true, &found);
                 if (r < 0)
                         return r;
 

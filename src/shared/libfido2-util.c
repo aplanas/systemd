@@ -158,6 +158,7 @@ static int verify_features(
                 fido_dev_t *d,
                 const char *path,
                 int log_level, /* the log level to use when device is not FIDO2 with hmac-secret */
+                bool require_hmac_secret,
                 bool *ret_has_rk,
                 bool *ret_has_client_pin,
                 bool *ret_has_up,
@@ -175,7 +176,8 @@ static int verify_features(
         assert(d);
         assert(path);
 
-        if (!sym_fido_dev_is_fido2(d))
+        /* Old U2F devices are not FIDO2 keys */
+        if (require_hmac_secret && !sym_fido_dev_is_fido2(d))
                 return log_full_errno(log_level, SYNTHETIC_ERRNO(ENODEV),
                                       "Specified device %s is not a FIDO2 device.", path);
 
@@ -213,7 +215,7 @@ static int verify_features(
                         has_always_uv = b[i];
         }
 
-        if (!found_extension)
+        if (require_hmac_secret && !found_extension)
                 return log_full_errno(log_level,
                                       SYNTHETIC_ERRNO(ENODEV),
                                        "Specified device %s is a FIDO2 device, but does not support the required HMAC-SECRET extension.", path);
@@ -330,7 +332,7 @@ static int fido2_is_cred_in_specific_token(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", path, sym_fido_strerr(r));
 
-        r = verify_features(d, path, LOG_ERR, /* ret_has_rk= */ NULL, /* ret_has_client_pin= */ NULL, &has_up, &has_uv, /* ret_has_always_uv= */ NULL);
+        r = verify_features(d, path, LOG_ERR, /* require_hmac_secret= */ true, /* ret_has_rk= */ NULL, /* ret_has_client_pin= */ NULL, &has_up, &has_uv, /* ret_has_always_uv= */ NULL);
         if (r == -ENODEV) { /* Not a FIDO2 device or lacking HMAC-SECRET extension */
                 log_debug_errno(r, "%s is not a FIDO2 device, or it lacks the hmac-secret extension", path);
                 return false;
@@ -442,7 +444,7 @@ static int fido2_use_hmac_hash_specific_token(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", path, sym_fido_strerr(r));
 
-        r = verify_features(d, path, LOG_ERR, /* ret_has_rk= */ NULL, &has_client_pin, &has_up, &has_uv, /* ret_has_always_uv= */ NULL);
+        r = verify_features(d, path, LOG_ERR, /* require_hmac_secret= */ true, /* ret_has_rk= */ NULL, &has_client_pin, &has_up, &has_uv, /* ret_has_always_uv= */ NULL);
         if (r < 0)
                 return r;
 
@@ -797,7 +799,7 @@ int fido2_generate_hmac_hash(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", device, sym_fido_strerr(r));
 
-        r = verify_features(d, device, LOG_ERR, &has_rk, &has_client_pin, &has_up, &has_uv, &has_always_uv);
+        r = verify_features(d, device, LOG_ERR, /* require_hmac_secret= */ true, &has_rk, &has_client_pin, &has_up, &has_uv, &has_always_uv);
         if (r < 0)
                 return r;
 
@@ -1162,7 +1164,7 @@ static int check_device_is_fido2_with_hmac_secret(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", path, sym_fido_strerr(r));
 
-        r = verify_features(d, path, LOG_DEBUG, ret_has_rk, ret_has_client_pin, ret_has_up, ret_has_uv, ret_has_always_uv);
+        r = verify_features(d, path, LOG_DEBUG, /* require_hmac_secret= */ true, ret_has_rk, ret_has_client_pin, ret_has_up, ret_has_uv, ret_has_always_uv);
         if (r == -ENODEV) { /* Not a FIDO2 device, or not implementing 'hmac-secret' */
                 *ret_has_rk = *ret_has_client_pin = *ret_has_up = *ret_has_uv = *ret_has_always_uv = false;
                 return false;
@@ -1202,7 +1204,7 @@ int fido2_list_devices(void) {
                 goto finish;
         }
 
-        t = table_new("path", "manufacturer", "product", "compatible", "rk", "clientpin", "up", "uv", "alwaysuv");
+        t = table_new("path", "manufacturer", "product", "hmac-secret", "rk", "clientpin", "up", "uv", "alwaysuv");
         if (!t) {
                 r = log_oom();
                 goto finish;
@@ -1222,14 +1224,14 @@ int fido2_list_devices(void) {
                 r = check_device_is_fido2_with_hmac_secret(sym_fido_dev_info_path(entry), &has_rk, &has_client_pin, &has_up, &has_uv, &has_always_uv);
                 if (r < 0)
                         goto finish;
-                bool compatible = r > 0;
+                bool has_hmac_secret = r > 0;
 
                 r = table_add_many(
                                 t,
                                 TABLE_PATH, sym_fido_dev_info_path(entry),
                                 TABLE_STRING, sym_fido_dev_info_manufacturer_string(entry),
                                 TABLE_STRING, sym_fido_dev_info_product_string(entry),
-                                TABLE_BOOLEAN_CHECKMARK, compatible,
+                                TABLE_BOOLEAN_CHECKMARK, has_hmac_secret,
                                 TABLE_BOOLEAN_CHECKMARK, has_rk,
                                 TABLE_BOOLEAN_CHECKMARK, has_client_pin,
                                 TABLE_BOOLEAN_CHECKMARK, has_up,
@@ -1247,10 +1249,11 @@ int fido2_list_devices(void) {
 
         if (!table_isempty(t))
                 printf("\n"
-                       "%1$sLegend: RK        %2$s Resident key%3$s\n"
-                       "%1$s        CLIENTPIN %2$s PIN request%3$s\n"
-                       "%1$s        UP        %2$s User presence%3$s\n"
-                       "%1$s        UV        %2$s User verification%3$s\n"
+                       "%1$sLegend: HMAC-SECRET %2$s HMAC secret (compatible with FIDO2-only enrollment)%3$s\n"
+                       "%1$sLegend: RK          %2$s Resident key%3$s\n"
+                       "%1$s        CLIENTPIN   %2$s PIN request%3$s\n"
+                       "%1$s        UP          %2$s User presence%3$s\n"
+                       "%1$s        UV          %2$s User verification%3$s\n",
                        "%1$s        AlwaysUV  %2$s User verification Required%3$s\n",
                        ansi_grey(),
                        glyph(GLYPH_ARROW_RIGHT),
@@ -1267,7 +1270,7 @@ finish:
 #endif
 }
 
-int fido2_find_device_auto(char **ret) {
+int fido2_find_device_auto(bool hmac_secret, char **ret) {
 #if HAVE_LIBFIDO2
         _cleanup_free_ char *copy = NULL;
         size_t di_size = 64, found = 0;
@@ -1306,18 +1309,20 @@ int fido2_find_device_auto(char **ret) {
                 goto finish;
         }
 
-        r = check_device_is_fido2_with_hmac_secret(
-                        sym_fido_dev_info_path(entry),
-                        /* ret_has_rk= */ NULL,
-                        /* ret_has_client_pin= */ NULL,
-                        /* ret_has_up= */ NULL,
-                        /* ret_has_uv= */ NULL,
-                        /* ret_has_always_uv= */ NULL);
-        if (r < 0)
-                goto finish;
-        if (!r) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "FIDO device discovered does not implement FIDO2 with 'hmac-secret' extension.");
-                goto finish;
+        if (hmac_secret) {
+                r = check_device_is_fido2_with_hmac_secret(
+                                sym_fido_dev_info_path(entry),
+                                /* ret_has_rk= */ NULL,
+                                /* ret_has_client_pin= */ NULL,
+                                /* ret_has_up= */ NULL,
+                                /* ret_has_uv= */ NULL,
+                                /* ret_has_always_uv= */ NULL);
+                if (r < 0)
+                        goto finish;
+                if (!r) {
+                        r = log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "FIDO device discovered does not implement FIDO2 with 'hmac-secret' extension.");
+                        goto finish;
+                }
         }
 
         path = sym_fido_dev_info_path(entry);
