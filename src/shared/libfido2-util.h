@@ -16,6 +16,12 @@ typedef enum Fido2EnrollFlags {
         _FIDO2ENROLL_TYPE_INVALID = -EINVAL,
 } Fido2EnrollFlags;
 
+typedef enum Fido2ExtensionFlags {
+        FIDO2EXTENSION_HMAC_SECRET = 1 << 0,
+        _FIDO2EXTENSION_TYPE_MAX,
+        _FIDO2EXTENSION_TYPE_INVALID = -EINVAL,
+} Fido2ExtensionFlags;
+
 int dlopen_libfido2(void);
 
 #if HAVE_LIBFIDO2
@@ -28,6 +34,7 @@ extern DLSYM_PROTOTYPE(fido_assert_free);
 extern DLSYM_PROTOTYPE(fido_assert_hmac_secret_len);
 extern DLSYM_PROTOTYPE(fido_assert_hmac_secret_ptr);
 extern DLSYM_PROTOTYPE(fido_assert_new);
+extern DLSYM_PROTOTYPE(fido_assert_set_clientdata);
 extern DLSYM_PROTOTYPE(fido_assert_set_clientdata_hash);
 extern DLSYM_PROTOTYPE(fido_assert_set_extensions);
 extern DLSYM_PROTOTYPE(fido_assert_set_hmac_salt);
@@ -94,6 +101,35 @@ static inline void fido_cred_free_wrapper(fido_cred_t **p) {
                 sym_fido_cred_free(p);
 }
 
+int fido2_generate_assert(
+                const char *device,
+                const char *rp_id,
+                const void *salt,
+                size_t salt_size,
+                const struct iovec *cid,
+                size_t cid_size,
+                char **pins,
+                Fido2EnrollFlags required,
+                Fido2ExtensionFlags required_extensions,
+                fido_assert_t **ret_assert);
+
+int fido2_generate_credential(
+                const char *device,
+                const char *rp_id,
+                const char *rp_name,
+                const void *user_id, size_t user_id_len,
+                const char *user_name,
+                const char *user_display_name,
+                const char *user_icon,
+                const char *askpw_icon,
+                const char *askpw_credential,
+                Fido2EnrollFlags lock_with,
+                int cred_alg,
+                Fido2ExtensionFlags required_extensions,
+                fido_cred_t **ret_cred,
+                char **ret_usedpin,
+                Fido2EnrollFlags *ret_locked_with);
+
 int fido2_use_hmac_hash(
                 const char *device,
                 const char *rp_id,
@@ -132,6 +168,6 @@ static inline int parse_fido2_algorithm(const char *s, int *ret) {
 #endif
 
 int fido2_list_devices(void);
-int fido2_find_device_auto(bool hmac_secret, char **ret);
+int fido2_find_device_auto(bool require_fido2, char **ret);
 
 int fido2_have_device(const char *device);
