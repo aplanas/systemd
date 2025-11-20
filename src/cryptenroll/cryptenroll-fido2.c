@@ -111,6 +111,44 @@ int enroll_fido2(
         if (r < 0)
                 return r;
 
+        // XXXXXX
+        printf("XXXX Testing credentials\n");
+        int fido2_play(const char *device,
+                       const char *rp_id,
+                       const char *rp_name,
+                       const void *user_id, size_t user_id_len,
+                       const char *user_name,
+                       const char *user_display_name,
+                       const char *user_icon,
+                       const char *askpw_icon,
+                       const char *askpw_credential,
+                       Fido2EnrollFlags lock_with,
+                       int cred_alg,
+                       const struct iovec *salt,
+                       void **ret_cid, size_t *ret_cid_size,
+                       void **ret_secret, size_t *ret_secret_size,
+                       char **ret_usedpin,
+                       Fido2EnrollFlags *ret_locked_with);
+        r = fido2_play(device,
+          /* rp_id= */ "io.systemd.cryptsetup",
+        /* rp_name= */ "Encrypted Volume",
+        /* user_id= */ un, strlen(un), /* We pass the user ID and name as the same: the disk's UUID if we have it */
+      /* user_name= */ un,
+/* user_display_name= */ node,
+      /* user_icon= */ NULL,
+     /* askpw_icon= */ "drive-harddisk",
+/* askpw_credential= */ "cryptenroll.fido2-pin",
+                       lock_with,
+                       cred_alg,
+                       &salt,
+                       &cid, &cid_size,
+                       &secret, &secret_size,
+                       NULL,
+                       &lock_with);
+        printf("XXXX Testing credentials (END)\n");
+        return -1;
+        // XXXXXX
+
         r = fido2_generate_hmac_hash(
                         device,
                         /* rp_id= */ "io.systemd.cryptsetup",
