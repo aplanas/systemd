@@ -4614,7 +4614,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (streq(optarg, "auto")) {
                                 _cleanup_free_ char *found = NULL;
 
-                                r = fido2_find_device_auto(/* hmac_secret= */ true, &found);
+                                r = fido2_find_device_auto(/* require_fido2= */ true, &found);
                                 if (r < 0)
                                         return r;
 

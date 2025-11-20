@@ -16,6 +16,12 @@ typedef enum Fido2EnrollFlags {
         _FIDO2ENROLL_TYPE_INVALID = -EINVAL,
 } Fido2EnrollFlags;
 
+typedef enum Fido2ExtensionFlags {
+        FIDO2EXTENSION_HMAC_SECRET = 1 << 0,
+        _FIDO2EXTENSION_TYPE_MAX,
+        _FIDO2EXTENSION_TYPE_INVALID = -EINVAL,
+} Fido2ExtensionFlags;
+
 int dlopen_libfido2(void);
 
 #if HAVE_LIBFIDO2
@@ -28,6 +34,7 @@ extern DLSYM_PROTOTYPE(fido_assert_free);
 extern DLSYM_PROTOTYPE(fido_assert_hmac_secret_len);
 extern DLSYM_PROTOTYPE(fido_assert_hmac_secret_ptr);
 extern DLSYM_PROTOTYPE(fido_assert_new);
+extern DLSYM_PROTOTYPE(fido_assert_set_clientdata);
 extern DLSYM_PROTOTYPE(fido_assert_set_clientdata_hash);
 extern DLSYM_PROTOTYPE(fido_assert_set_extensions);
 extern DLSYM_PROTOTYPE(fido_assert_set_hmac_salt);
@@ -132,6 +139,6 @@ static inline int parse_fido2_algorithm(const char *s, int *ret) {
 #endif
 
 int fido2_list_devices(void);
-int fido2_find_device_auto(bool hmac_secret, char **ret);
+int fido2_find_device_auto(bool require_fido2, char **ret);
 
 int fido2_have_device(const char *device);
