@@ -353,6 +353,10 @@ executables += [
                 'dependencies' : libfido2_cflags,
         },
         test_template + {
+                'sources' : files('test-cryptsetup-util.c'),
+                'dependencies' : libcryptsetup_cflags,
+        },
+        test_template + {
                 'sources' : files('test-dbus-name-holder.c'),
                 'type' : 'manual',
         },
