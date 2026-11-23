@@ -4886,20 +4886,38 @@ static int find_signature(
         /* Now iterate through all signatures known for this bank */
         JSON_VARIANT_ARRAY_FOREACH(i, b) {
                 _cleanup_free_ void *fpj_data = NULL, *polj_data = NULL;
-                const char *refj_data = NULL;
-                sd_json_variant *maskj, *fpj, *sigj, *polj, *refj;
+                struct {
+                        sd_json_variant *pcrs;
+                        sd_json_variant *pkfp;
+                        const char *ref;
+                        sd_json_variant *pol;
+                        sd_json_variant *sig;
+                } e = {};
                 size_t fpj_size, polj_size;
                 uint32_t parsed_mask;
+
+                /* The values are decoded below in order, and only as far as the entry matches */
+                static const sd_json_dispatch_field dispatch_table[] = {
+                        { "pcrs", SD_JSON_VARIANT_ARRAY,  sd_json_dispatch_variant_noref, voffsetof(e, pcrs), 0 },
+                        { "pkfp", SD_JSON_VARIANT_STRING, sd_json_dispatch_variant_noref, voffsetof(e, pkfp), 0 },
+                        { "ref",  SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,  voffsetof(e, ref),  0 },
+                        { "pol",  SD_JSON_VARIANT_STRING, sd_json_dispatch_variant_noref, voffsetof(e, pol),  0 },
+                        { "sig",  SD_JSON_VARIANT_STRING, sd_json_dispatch_variant_noref, voffsetof(e, sig),  0 },
+                        {}
+                };
 
                 if (!sd_json_variant_is_object(i))
                         return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Bank data element is not a JSON object");
 
+                r = sd_json_dispatch(i, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &e);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to parse bank data element: %m");
+
                 /* Check if the PCR mask matches our expectations */
-                maskj = sd_json_variant_by_key(i, "pcrs");
-                if (!maskj)
+                if (!e.pcrs)
                         continue;
 
-                r = tpm2_parse_pcr_json_array(maskj, &parsed_mask);
+                r = tpm2_parse_pcr_json_array(e.pcrs, &parsed_mask);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to parse JSON PCR mask");
 
@@ -4907,34 +4925,25 @@ static int find_signature(
                         continue; /* Not for this PCR mask */
 
                 /* Then check if this is for the public key we operate with */
-                fpj = sd_json_variant_by_key(i, "pkfp");
-                if (!fpj)
+                if (!e.pkfp)
                         continue;
 
-                r = sd_json_variant_unhex(fpj, &fpj_data, &fpj_size);
+                r = sd_json_variant_unhex(e.pkfp, &fpj_data, &fpj_size);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to decode fingerprint in JSON data: %m");
 
                 if (memcmp_nn(fp, fp_size, fpj_data, fpj_size) != 0)
                         continue; /* Not for this public key */
 
-                refj = sd_json_variant_by_key(i, "ref");
-                if (refj) {
-                        refj_data = sd_json_variant_string(refj);
-                        if (!refj_data)
-                                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Policy reference is not a string.");
-                }
-
-                if (!streq_ptr(policy_ref, refj_data))
+                if (!streq_ptr(policy_ref, e.ref))
                         continue;
 
                 /* Finally, check if this is for the PCR policy we expect this to be */
-                polj = sd_json_variant_by_key(i, "pol");
-                if (!polj)
+                if (!e.pol)
                         continue;
 
                 if (policy) {
-                        r = sd_json_variant_unhex(polj, &polj_data, &polj_size);
+                        r = sd_json_variant_unhex(e.pol, &polj_data, &polj_size);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to decode policy hash JSON data: %m");
 
@@ -4943,14 +4952,13 @@ static int find_signature(
                 }
 
                 /* This entry matches all our expectations, now return the signature included in it */
-                sigj = sd_json_variant_by_key(i, "sig");
-                if (!sigj)
+                if (!e.sig)
                         continue;
 
                 if (!ret_signature)
                         return 0;
 
-                return sd_json_variant_unbase64(sigj, ret_signature, ret_signature_size);
+                return sd_json_variant_unbase64(e.sig, ret_signature, ret_signature_size);
         }
 
         return log_debug_errno(SYNTHETIC_ERRNO(ENOSTR), "Couldn't find signature for this PCR bank, PCR index and public key.");
@@ -10386,27 +10394,28 @@ int tpm2_pcr_prediction_from_json(
 
         sd_json_variant *pcr;
         JSON_VARIANT_ARRAY_FOREACH(pcr, aj) {
-                sd_json_variant *nr, *values;
+                struct {
+                        unsigned nr;
+                        sd_json_variant *values;
+                } e = {};
 
-                nr = sd_json_variant_by_key(pcr, "pcr");
-                if (!nr)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "PCR array entry lacks PCR index field");
+                static const sd_json_dispatch_field dispatch_table[] = {
+                        { "pcr",    SD_JSON_VARIANT_UNSIGNED,      sd_json_dispatch_uint,          voffsetof(e, nr),     SD_JSON_MANDATORY },
+                        { "values", SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_variant_noref, voffsetof(e, values), SD_JSON_MANDATORY },
+                        {}
+                };
 
-                if (!sd_json_variant_is_unsigned(nr) ||
-                    sd_json_variant_unsigned(nr) >= TPM2_PCRS_MAX)
+                r = sd_json_dispatch(pcr, dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &e);
+                if (r < 0)
+                        return -EBADMSG;
+
+                if (e.nr >= TPM2_PCRS_MAX)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "PCR array entry PCR index is not an integer in the range 0…23");
 
-                values = sd_json_variant_by_key(pcr, "values");
-                if (!values)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "PCR array entry lacks values field");
-
-                if (!sd_json_variant_is_array(values))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "PCR array entry values field is not an array");
-
-                prediction->pcrs |= UINT32_C(1) << sd_json_variant_unsigned(nr);
+                prediction->pcrs |= UINT32_C(1) << e.nr;
 
                 sd_json_variant *v;
-                JSON_VARIANT_ARRAY_FOREACH(v, values) {
+                JSON_VARIANT_ARRAY_FOREACH(v, e.values) {
                         _cleanup_free_ void *buffer = NULL;
                         size_t size;
 
@@ -10427,7 +10436,7 @@ int tpm2_pcr_prediction_from_json(
                         memcpy(banks->hash[alg_index].buffer, buffer, size);
                         banks->hash[alg_index].size = size;
 
-                        r = ordered_set_ensure_put(prediction->results + sd_json_variant_unsigned(nr), &tpm2_pcr_prediction_result_hash_ops, banks);
+                        r = ordered_set_ensure_put(prediction->results + e.nr, &tpm2_pcr_prediction_result_hash_ops, banks);
                         if (r == -EEXIST) /* Let's allow duplicates */
                                 continue;
                         if (r < 0)
