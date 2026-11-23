@@ -349,6 +349,10 @@ executables += [
                 'conditions' : ['HAVE_OPENSSL'],
         },
         test_template + {
+                'sources' : files('test-cryptsetup-fido2.c'),
+                'dependencies' : libfido2_cflags,
+        },
+        test_template + {
                 'sources' : files('test-dbus-name-holder.c'),
                 'type' : 'manual',
         },

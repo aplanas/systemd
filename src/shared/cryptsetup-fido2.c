@@ -2,17 +2,90 @@
 
 #include "sd-json.h"
 
-#include "alloc-util.h"
 #include "ask-password-api.h"
 #include "cryptsetup-fido2.h"
 #include "cryptsetup-util.h"
 #include "env-util.h"
 #include "fido2-util.h"
 #include "iovec-util.h"
+#include "json-util.h"
 #include "libfido2-util.h"
 #include "log.h"
 
 #include "strv.h"
+
+void fido2_luks2_token_done(Fido2Luks2Token *t) {
+        assert(t);
+
+        iovec_done(&t->cid);
+        iovec_done(&t->salt);
+        t->rp_id = mfree(t->rp_id);
+}
+
+typedef struct Fido2Luks2TokenFields {
+        Fido2Luks2Token token;
+        int pin_required;
+        int up_required;
+        int uv_required;
+} Fido2Luks2TokenFields;
+
+static void fido2_luks2_token_fields_done(Fido2Luks2TokenFields *f) {
+        assert(f);
+
+        fido2_luks2_token_done(&f->token);
+}
+
+int fido2_luks2_token_parse(sd_json_variant *v, Fido2Luks2Token *ret) {
+        _cleanup_(fido2_luks2_token_fields_done) Fido2Luks2TokenFields f = {
+                .pin_required = -1,
+                .up_required = -1,
+                .uv_required = -1,
+        };
+        int r;
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "fido2-credential",         SD_JSON_VARIANT_STRING,  json_dispatch_unbase64_iovec, offsetof(Fido2Luks2TokenFields, token.cid),    SD_JSON_MANDATORY },
+                { "fido2-salt",               SD_JSON_VARIANT_STRING,  json_dispatch_unbase64_iovec, offsetof(Fido2Luks2TokenFields, token.salt),   SD_JSON_MANDATORY },
+                { "fido2-rp",                 SD_JSON_VARIANT_STRING,  sd_json_dispatch_string,      offsetof(Fido2Luks2TokenFields, token.rp_id),  0                 },
+                { "fido2-clientPin-required", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,    offsetof(Fido2Luks2TokenFields, pin_required), 0                 },
+                { "fido2-up-required",        SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,    offsetof(Fido2Luks2TokenFields, up_required),  0                 },
+                { "fido2-uv-required",        SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,    offsetof(Fido2Luks2TokenFields, uv_required),  0                 },
+                {}
+        };
+
+        assert(v);
+        assert(ret);
+
+        /* Parses the JSON of a "systemd-fido2" LUKS2 token. The "fido2-rp" field and the three
+         * "fido2-*-required" fields are optional. Tokens enrolled by v248 do not have the
+         * "fido2-*-required" fields. For them we use the *_IF_NEEDED and *_OMIT flags. */
+
+        r = sd_json_dispatch(v, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &f);
+        if (r == -ENXIO)
+                /* A missing field means a broken token. Callers take -ENXIO as "no token", so do not
+                 * return it. */
+                return -EBADMSG;
+        if (r < 0)
+                return r;
+
+        if (f.pin_required >= 0)
+                SET_FLAG(f.token.required, FIDO2ENROLL_PIN, f.pin_required);
+        else
+                f.token.required |= FIDO2ENROLL_PIN_IF_NEEDED;
+
+        if (f.up_required >= 0)
+                SET_FLAG(f.token.required, FIDO2ENROLL_UP, f.up_required);
+        else
+                f.token.required |= FIDO2ENROLL_UP_IF_NEEDED;
+
+        if (f.uv_required >= 0)
+                SET_FLAG(f.token.required, FIDO2ENROLL_UV, f.uv_required);
+        else
+                f.token.required |= FIDO2ENROLL_UV_OMIT;
+
+        *ret = TAKE_STRUCT(f.token);
+        return 0;
+}
 
 int acquire_fido2_key(
                 const char *volume_name,
@@ -148,10 +221,8 @@ int acquire_fido2_key_auto(
                 size_t *ret_decrypted_key_size) {
 
 #if HAVE_LIBCRYPTSETUP && HAVE_LIBFIDO2
-        _cleanup_free_ void *cid = NULL;
-        size_t cid_size = 0;
+        bool found = false;
         int r, ret = -ENOENT;
-        Fido2EnrollFlags required = 0;
 
         assert(cd);
         assert(name);
@@ -162,10 +233,7 @@ int acquire_fido2_key_auto(
 
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
-                sd_json_variant *w;
-                _cleanup_free_ void *salt = NULL;
-                _cleanup_free_ char *rp = NULL;
-                size_t salt_size = 0;
+                _cleanup_(fido2_luks2_token_done) Fido2Luks2Token t = {};
                 int ks;
 
                 r = cryptsetup_get_token_as_json(cd, token, "systemd-fido2", &v);
@@ -182,88 +250,24 @@ int acquire_fido2_key_auto(
                         continue;
                 }
 
-                w = sd_json_variant_by_key(v, "fido2-credential");
-                if (!w)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "FIDO2 token data lacks 'fido2-credential' field.");
-
-                r = sd_json_variant_unbase64(w, &cid, &cid_size);
+                r = fido2_luks2_token_parse(v, &t);
                 if (r < 0)
-                        return log_error_errno(r, "Invalid base64 data in 'fido2-credential' field: %m");
+                        return log_error_errno(r, "Failed to parse FIDO2 JSON data token %i: %m", token);
 
-                w = sd_json_variant_by_key(v, "fido2-salt");
-                if (!w)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "FIDO2 token data lacks 'fido2-salt' field.");
-
-                assert(!salt);
-                assert(salt_size == 0);
-                r = sd_json_variant_unbase64(w, &salt, &salt_size);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to decode base64 encoded salt: %m");
-
-                w = sd_json_variant_by_key(v, "fido2-rp");
-                if (w) {
-                        /* The "rp" field is optional. */
-
-                        if (!sd_json_variant_is_string(w))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "FIDO2 token data's 'fido2-rp' field is not a string.");
-
-                        assert(!rp);
-                        rp = strdup(sd_json_variant_string(w));
-                        if (!rp)
-                                return log_oom();
-                }
-
-                w = sd_json_variant_by_key(v, "fido2-clientPin-required");
-                if (w) {
-                        /* The "fido2-clientPin-required" field is optional. */
-
-                        if (!sd_json_variant_is_boolean(w))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "FIDO2 token data's 'fido2-clientPin-required' field is not a boolean.");
-
-                        SET_FLAG(required, FIDO2ENROLL_PIN, sd_json_variant_boolean(w));
-                } else
-                        required |= FIDO2ENROLL_PIN_IF_NEEDED; /* compat with 248, where the field was unset */
-
-                w = sd_json_variant_by_key(v, "fido2-up-required");
-                if (w) {
-                        /* The "fido2-up-required" field is optional. */
-
-                        if (!sd_json_variant_is_boolean(w))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "FIDO2 token data's 'fido2-up-required' field is not a boolean.");
-
-                        SET_FLAG(required, FIDO2ENROLL_UP, sd_json_variant_boolean(w));
-                } else
-                        required |= FIDO2ENROLL_UP_IF_NEEDED; /* compat with 248 */
-
-                w = sd_json_variant_by_key(v, "fido2-uv-required");
-                if (w) {
-                        /* The "fido2-uv-required" field is optional. */
-
-                        if (!sd_json_variant_is_boolean(w))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "FIDO2 token data's 'fido2-uv-required' field is not a boolean.");
-
-                        SET_FLAG(required, FIDO2ENROLL_UV, sd_json_variant_boolean(w));
-                } else
-                        required |= FIDO2ENROLL_UV_OMIT; /* compat with 248 */
+                found = true;
 
                 ret = acquire_fido2_key(
                                 name,
                                 friendly_name,
                                 fido2_device,
-                                rp,
-                                cid, cid_size,
+                                t.rp_id,
+                                t.cid.iov_base, t.cid.iov_len,
                                 /* key_file= */ NULL, /* salt is read from LUKS header instead of key_file */
                                 /* key_file_size= */ 0,
                                 /* key_file_offset= */ 0,
-                                &IOVEC_MAKE(salt, salt_size),
+                                &t.salt,
                                 until,
-                                required,
+                                t.required,
                                 "cryptsetup.fido2-pin",
                                 askpw_flags,
                                 ret_decrypted_key,
@@ -272,7 +276,7 @@ int acquire_fido2_key_auto(
                         break;
         }
 
-        if (!cid) /* Callers decide whether this is an error, or whether they fall back to something else */
+        if (!found) /* Callers decide whether this is an error, or whether they fall back to something else */
                 return log_debug_errno(SYNTHETIC_ERRNO(ENXIO),
                                        "No valid FIDO2 token data found.");
 
